@@ -69,7 +69,15 @@
     },
     "event": {
       "alarm": {
-        "name": "Alarm"
+        "name": "Alarm",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "alarm": "Alarm",
+              "video": "Alarm video ready"
+            }
+          }
+        }
       }
     }
   },

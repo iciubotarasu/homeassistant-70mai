@@ -39,7 +39,7 @@ class Mai70AlarmEvent(Mai70Entity, EventEntity):
 
     _attr_translation_key = "alarm"
     _attr_name = None
-    _attr_event_types = ["alarm"]
+    _attr_event_types = ["alarm", "video"]
     _attr_icon = "mdi:bell-alert-outline"
 
     def __init__(self, coordinator: Mai70Coordinator, device_id: str) -> None:
@@ -61,6 +61,25 @@ class Mai70AlarmEvent(Mai70Entity, EventEntity):
                     "video_url": alarm.get("video_url"),
                     "cover_url": alarm.get("cover_url"),
                     "raw": alarm["raw"],
+                },
+            )
+        # Fired once per alarm when its uploaded clips (front/rear) get
+        # pre-signed download URLs, usually a few minutes after "alarm".
+        for alarm in self._device_data.get("new_videos", []):
+            videos = alarm.get("videos") or {}
+            main = videos.get("front_video") or next(iter(videos.values()), {})
+            self._trigger_event(
+                "video",
+                {
+                    "alarm_id": alarm["alarm_id"],
+                    "alarm_type": alarm.get("alarm_type"),
+                    "happen_time": alarm.get("happen_time"),
+                    "latitude": alarm.get("latitude"),
+                    "longitude": alarm.get("longitude"),
+                    "video_url": main.get("url"),
+                    "cover_url": main.get("cover_url") or alarm.get("cover_url"),
+                    "videos": videos,
+                    "complete": alarm.get("complete"),
                 },
             )
         super()._handle_coordinator_update()

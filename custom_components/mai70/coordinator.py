@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from datetime import date, datetime, timedelta
@@ -35,6 +36,39 @@ _DEVICE_NAME_KEYS = ("nickName", "ssid", "deviceId")
 # get_device_alarm_list()'s confirmed item schema uses "id"; "alarmId" is
 # kept as a defensive fallback only.
 _ALARM_ID_KEYS = ("id", "alarmId")
+
+# An alarm's clips are uploaded to 70mai's cloud some time after the alarm
+# itself shows up in getDeviceAlarmList (the alarm's own videoUrl is often
+# null and only `attachment` names the userspace files). Pending clips are
+# re-checked with getFileDetails on every poll until all of them have a
+# pre-signed mainUrl, then reported once as a "video" event. After
+# _VIDEO_PARTIAL_AFTER whatever has arrived is reported anyway (e.g. a
+# rear clip that never uploads); after _VIDEO_GIVE_UP with nothing, the
+# alarm is dropped.
+_VIDEO_PARTIAL_AFTER = timedelta(minutes=30)
+_VIDEO_GIVE_UP = timedelta(hours=2)
+
+
+def _parse_attachments(alarm: Dict[str, Any]) -> Dict[str, str]:
+    """Map an alarm's attachment keys ("front_video", "backend_video", ...)
+    to their userspaceFileId. `attachment` is a JSON string in the
+    confirmed captures; a list is accepted defensively."""
+    raw = alarm.get("attachment")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return {}
+    if not isinstance(raw, list):
+        return {}
+    files: Dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key, file_id = item.get("key"), item.get("userspaceFileId")
+        if key and file_id:
+            files[str(key)] = str(file_id)
+    return files
 
 # get_all_device_for_user() pagination: page size to request, and a hard
 # cap on the number of pages fetched per poll so a cursor/API bug can't
@@ -87,6 +121,8 @@ class Mai70Coordinator(DataUpdateCoordinator):
         self._plain_password = plain_password
         self._last_poll_ms: Optional[int] = None
         self._seen_alarm_ids: Dict[str, set] = {}
+        # device_id -> alarm_id -> pending clip info (see _VIDEO_PARTIAL_AFTER)
+        self._pending_videos: Dict[str, Dict[str, Dict[str, Any]]] = {}
         # monotonic timestamp of the last detected session invalidation
         # (see _on_session_invalidated), or None if the session is fine.
         self._token_invalid_since: Optional[float] = None
@@ -180,6 +216,7 @@ class Mai70Coordinator(DataUpdateCoordinator):
                 # No "position" here: Mai70PositionCoordinator polls it.
                 **await self._async_get_battery(device_id),
                 "new_alarms": await self._async_get_new_alarms(device_id, begin_ms, now_ms),
+                "new_videos": await self._async_resolve_pending_videos(device_id),
                 "dashcam_detail": await self._async_get_dashcam_detail(device_id),
                 "cellular": await self._async_get_cellular_info(device_id),
                 "country_code": country_code,
@@ -520,7 +557,62 @@ class Mai70Coordinator(DataUpdateCoordinator):
                     "raw": alarm,
                 }
             )
+            files = _parse_attachments(alarm)
+            if files:
+                self._pending_videos.setdefault(device_id, {})[alarm_id] = {
+                    "alarm": new_alarms[-1],
+                    "files": files,
+                    "first_seen": time.monotonic(),
+                }
         return new_alarms
+
+    async def _async_resolve_pending_videos(self, device_id: str) -> List[Dict[str, Any]]:
+        """Look up pre-signed URLs for pending alarm clips; return the
+        alarms whose clips are now (fully, or after a timeout partially)
+        available, each with a "videos" dict {attachment key: info}."""
+        pending = self._pending_videos.get(device_id)
+        if not pending:
+            return []
+        file_ids = sorted({fid for p in pending.values() for fid in p["files"].values()})
+        try:
+            resp = await self._async_call(self.client.get_file_details, file_ids)
+        except MaiError as exc:
+            _LOGGER.debug("getFileDetails failed for %s: %s", device_id, exc)
+            return []
+        details = resp.get("resultBodyObject")
+        by_id: Dict[str, Dict[str, Any]] = {}
+        if isinstance(details, list):
+            for item in details:
+                if isinstance(item, dict) and item.get("fileId") and item.get("mainUrl"):
+                    by_id[str(item["fileId"])] = item
+
+        ready: List[Dict[str, Any]] = []
+        now = time.monotonic()
+        for alarm_id in list(pending):
+            entry = pending[alarm_id]
+            videos = {
+                key: {
+                    "url": by_id[fid]["mainUrl"],
+                    "cover_url": by_id[fid].get("videoCoverUrl"),
+                    "file_name": by_id[fid].get("fileOrigName") or by_id[fid].get("fileName"),
+                    "size": by_id[fid].get("mainSize"),
+                    "width": by_id[fid].get("mainWidth"),
+                    "height": by_id[fid].get("mainHeight"),
+                    "start_ts": by_id[fid].get("fileStartTs"),
+                    "end_ts": by_id[fid].get("fileEndTs"),
+                }
+                for key, fid in entry["files"].items()
+                if fid in by_id
+            }
+            age = timedelta(seconds=now - entry["first_seen"])
+            complete = len(videos) == len(entry["files"])
+            if complete or (videos and age >= _VIDEO_PARTIAL_AFTER):
+                ready.append({**entry["alarm"], "videos": videos, "complete": complete})
+                del pending[alarm_id]
+            elif age >= _VIDEO_GIVE_UP:
+                _LOGGER.debug("Giving up on clips for alarm %s of %s", alarm_id, device_id)
+                del pending[alarm_id]
+        return ready
 
 
 def _position_scan_interval(
