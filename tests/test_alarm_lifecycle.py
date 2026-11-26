@@ -173,3 +173,11 @@ async def test_static_data_is_cached_between_alarm_polls(hass: HomeAssistant) ->
     assert client.call_count("get_device_switch") == before["get_device_switch"]
     assert client.call_count("check_new_rom_from_app") == before["check_new_rom_from_app"]
     assert client.call_count("get_device_alarm_list") == before["get_device_alarm_list"] + 1
+
+
+async def test_last_alarm_image_from_initial_sync(hass: HomeAssistant) -> None:
+    client = Client()
+    client.alarms = [_alarm("old", 107)]
+    await setup_integration(hass, client)
+    entity_id = er.async_get(hass).async_get_entity_id("image", DOMAIN, f"{DEVICE_ID}_last_alarm")
+    assert entity_id is not None

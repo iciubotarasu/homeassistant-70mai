@@ -837,6 +837,8 @@ class Mai70Coordinator(DataUpdateCoordinator):
             alarms = []
         if not isinstance(alarms, list):
             return None
+        self._last_alarm_list_size = {"device": device_id, "count": len(alarms), "begin_ms": begin_ms, "end_ms": now_ms, "error": resp.get("error"), "error_message": resp.get("errorMessage")}
+        _LOGGER.debug("getDeviceAlarmList %s [%s..%s]: %s alarms", device_id, begin_ms, now_ms, len(alarms))
 
         seen = self._seen_alarm_ids.setdefault(device_id, {})
         new_alarms = []
