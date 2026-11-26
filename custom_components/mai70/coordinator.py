@@ -107,6 +107,23 @@ def _is_session_invalidated(resp: Any) -> bool:
     return "token" in str(resp.get("errorMessage", "")).lower()
 
 
+def _alarm_summary(alarm_id: str, alarm: Dict[str, Any]) -> Dict[str, Any]:
+    """The fields of a getDeviceAlarmList item the alarm/video events carry.
+    alramType's meaning per code isn't confirmed (101 is a collision alarm;
+    the rest are guesses), so the code is passed through as-is."""
+    return {
+        "alarm_id": alarm_id,
+        "alarm_type": alarm.get("alramType"),
+        "happen_time": alarm.get("happenTime"),
+        "latitude": alarm.get("coordinatesLat"),
+        "longitude": alarm.get("coordinatesLng"),
+        "picture_url": alarm.get("pictureUrl"),
+        "video_url": alarm.get("videoUrl"),
+        "cover_url": alarm.get("coverUrl"),
+        "raw": alarm,
+    }
+
+
 class Mai70Coordinator(DataUpdateCoordinator):
     """Polls the 70mai cloud API for every device bound to one account."""
 
@@ -540,23 +557,7 @@ class Mai70Coordinator(DataUpdateCoordinator):
             if alarm_id is None or alarm_id in seen:
                 continue
             seen.add(alarm_id)
-            new_alarms.append(
-                {
-                    "alarm_id": alarm_id,
-                    # alramType's exact meaning per code isn't confirmed
-                    # (101 is a collision alarm, seen with GPS + video; the
-                    # rest are unconfirmed guesses), so the code is passed
-                    # through as-is rather than mapped to a label.
-                    "alarm_type": alarm.get("alramType"),
-                    "happen_time": alarm.get("happenTime"),
-                    "latitude": alarm.get("coordinatesLat"),
-                    "longitude": alarm.get("coordinatesLng"),
-                    "picture_url": alarm.get("pictureUrl"),
-                    "video_url": alarm.get("videoUrl"),
-                    "cover_url": alarm.get("coverUrl"),
-                    "raw": alarm,
-                }
-            )
+            new_alarms.append(_alarm_summary(alarm_id, alarm))
             files = _parse_attachments(alarm)
             if files:
                 self._pending_videos.setdefault(device_id, {})[alarm_id] = {
@@ -565,6 +566,49 @@ class Mai70Coordinator(DataUpdateCoordinator):
                     "first_seen": time.monotonic(),
                 }
         return new_alarms
+
+    async def async_requeue_alarm_videos(self, hours: float) -> int:
+        """Queue the clips of every alarm from the last `hours` again, even
+        alarms already reported, and refresh so a "video" event fires for
+        each one whose clips are available. For alarms missed while Home
+        Assistant was restarting or the integration was being set up (their
+        first poll runs before the event entity exists). Returns how many
+        alarms were queued."""
+        try:
+            await self._async_ensure_logged_in()
+        except MaiError as exc:
+            raise UpdateFailed(str(exc)) from exc
+        now_ms = int(datetime.now().timestamp() * 1000)
+        begin_ms = now_ms - int(hours * 3600 * 1000)
+        queued = 0
+        for device_id in list(self.data or {}):
+            try:
+                resp = await self._async_call(
+                    self.client.get_device_alarm_list, device_id, begin_ms, now_ms
+                )
+            except MaiError as exc:
+                _LOGGER.warning("getDeviceAlarmList failed for %s: %s", device_id, exc)
+                continue
+            alarms = resp.get("resultBodyObject")
+            if not isinstance(alarms, list):
+                continue
+            for alarm in alarms:
+                if not isinstance(alarm, dict):
+                    continue
+                alarm_id = _first_present(alarm, _ALARM_ID_KEYS)
+                files = _parse_attachments(alarm)
+                if alarm_id is None or not files:
+                    continue
+                self._seen_alarm_ids.setdefault(device_id, set()).add(alarm_id)
+                self._pending_videos.setdefault(device_id, {})[alarm_id] = {
+                    "alarm": _alarm_summary(alarm_id, alarm),
+                    "files": files,
+                    "first_seen": time.monotonic(),
+                }
+                queued += 1
+        if queued:
+            await self.async_refresh()
+        return queued
 
     async def _async_resolve_pending_videos(self, device_id: str) -> List[Dict[str, Any]]:
         """Look up pre-signed URLs for pending alarm clips; return the

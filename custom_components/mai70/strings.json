@@ -90,5 +90,17 @@
         "us": "USA (us-api.70mai.com, unconfirmed)"
       }
     }
+  },
+  "services": {
+    "fetch_alarm_videos": {
+      "name": "Fetch alarm videos",
+      "description": "Look up the uploaded clips of every alarm from the last hours again, including alarms already reported, and fire a \"video\" event on the alarm entity for each one whose clips are available.",
+      "fields": {
+        "hours": {
+          "name": "Hours",
+          "description": "How far back to look for alarms."
+        }
+      }
+    }
   }
 }

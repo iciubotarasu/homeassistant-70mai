@@ -123,3 +123,24 @@ async def test_video_event_after_upload(hass: HomeAssistant) -> None:
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert client.call_count("get_file_details") == calls
+
+
+async def test_fetch_alarm_videos_service(hass: HomeAssistant) -> None:
+    """An alarm already seen (e.g. on the setup poll, before the event
+    entity existed) gets its "video" event through the service."""
+    client = AlarmClient()
+    client.alarms = [_alarm(json.dumps([{"key": "front_video", "userspaceFileId": FRONT_ID}]))]
+    client.files[FRONT_ID] = _file(FRONT_ID, FRONT_URL)
+    await setup_integration(hass, client)
+    entity_id = er.async_get(hass).async_get_entity_id("event", DOMAIN, f"{DEVICE_ID}_alarm")
+    # The setup poll saw the alarm before the entity existed: no event.
+    assert hass.states.get(entity_id).attributes.get("event_type") is None
+
+    response = await hass.services.async_call(
+        DOMAIN, "fetch_alarm_videos", {"hours": 24}, blocking=True, return_response=True
+    )
+    await hass.async_block_till_done()
+    assert response == {"queued_alarms": 1}
+    state = hass.states.get(entity_id)
+    assert state.attributes["event_type"] == "video"
+    assert state.attributes["video_url"] == FRONT_URL
