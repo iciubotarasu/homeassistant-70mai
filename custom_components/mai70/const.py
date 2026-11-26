@@ -36,6 +36,85 @@ SERVER_CHOICES = {
 
 DEFAULT_SCAN_INTERVAL = timedelta(minutes=5)
 
+# The main coordinator runs every ALARM_SCAN_INTERVAL so a new alarm shows
+# up within a minute, but only the alarm endpoints are called on every run.
+# Everything else is cached and re-fetched only once it is older than its
+# group's interval: fast-changing data (battery, dashcam status, signal)
+# after DETAIL_REFRESH_INTERVAL, data that practically never changes
+# (device list, account country, firmware, SIM plugin, upload switch, SIM
+# external power) after STATIC_REFRESH_INTERVAL. That is fewer requests per
+# hour than the old "everything every 5 minutes" poll. While Firebase push
+# is connected (push.py), alarms arrive by push and the alarm poll slows to
+# ALARM_SCAN_INTERVAL_PUSH as a safety net.
+ALARM_SCAN_INTERVAL = timedelta(minutes=1)
+ALARM_SCAN_INTERVAL_PUSH = timedelta(minutes=5)
+DETAIL_REFRESH_INTERVAL = timedelta(minutes=5)
+STATIC_REFRESH_INTERVAL = timedelta(hours=1)
+
+# A collision alarm (101) is first reported as "suspected" (eventStatus 1)
+# and resolved later by 70mai to "normal boarding" (2, the owner got in) or
+# "collision confirmed" (3, with a clip). Unresolved ones are re-checked
+# with getDeviceAlarm on every poll for this long.
+COLLISION_TRACK_TIMEOUT = timedelta(minutes=30)
+
+# Alarm names and descriptions, as the 70mai Android app (4.5.0,
+# com.banyac.dashcam.model.DeviceAlarm.getAlarmTitle/getAlarmDetail and its
+# English strings) shows them. 101 depends on eventStatus.
+ALARM_COLLISION = 101
+COLLISION_SUSPECTED = 1
+COLLISION_BOARDING = 2
+COLLISION_CONFIRMED = 3
+COLLISION_NAMES = {
+    COLLISION_SUSPECTED: (
+        "Vehicle suspected of collision",
+        "Collision occurs. Please view your vehicle status.",
+    ),
+    COLLISION_BOARDING: (
+        "Normal boarding behavior",
+        "Your vehicle starts normally. Cancelling collision warning.",
+    ),
+    COLLISION_CONFIRMED: (
+        "Vehicle collision detected",
+        "Collision has been detected. Please check your vehicle status.",
+    ),
+}
+ALARM_NAMES = {
+    102: ("Vehicle driving out of the geo-fence", "The vehicle left a geo-fence."),
+    103: ("Remote surveillance video", "Remotely filmed video uploaded."),
+    104: (
+        "Overheat protection",
+        "Ambient temperature high, Dash Cam is shutting down for protection.",
+    ),
+    105: (
+        "Battery protection",
+        "The vehicle battery voltage has dropped to the protection value you "
+        "set, and the Dash Cam automatically powers off.",
+    ),
+    106: ("Remote surveillance photo", "Your remotely taken image has been uploaded."),
+    107: (
+        "Suspicious persons detected",
+        "There are suspicious persons around your vehicle. Please promptly "
+        "check the vehicle status.",
+    ),
+    108: (
+        "Parking surveillance global timer",
+        "Dash Cam has turned off as scheduled by the parking surveillance "
+        "global duration, to save car battery power.",
+    ),
+    109: ("Vehicle entered the geo-fence", "The vehicle entered a geo-fence."),
+}
+
+
+def alarm_name(alarm_type, event_status=None):
+    """(name, description) for an alarm, or (None, None) for an unknown code."""
+    try:
+        alarm_type = int(alarm_type)
+    except (TypeError, ValueError):
+        return None, None
+    if alarm_type == ALARM_COLLISION:
+        return COLLISION_NAMES.get(event_status, COLLISION_NAMES[COLLISION_SUSPECTED])
+    return ALARM_NAMES.get(alarm_type, (None, None))
+
 # getPosition has its own faster, adaptive poll
 # (coordinator.Mai70PositionCoordinator) instead of riding along with the
 # DEFAULT_SCAN_INTERVAL poll of every other endpoint. A dashcam that is

@@ -28,6 +28,10 @@ def _entity_id(hass: HomeAssistant) -> Optional[str]:
 
 
 async def _poll(hass: HomeAssistant) -> None:
+    # The battery is cached for DETAIL_REFRESH_INTERVAL of real (monotonic)
+    # time, which fired timers don't advance: expire it by hand.
+    for coordinator in hass.data[DOMAIN].values():
+        coordinator.invalidate_cache()
     async_fire_time_changed(hass, dt_util.utcnow() + DEFAULT_SCAN_INTERVAL)
     await hass.async_block_till_done(wait_background_tasks=True)
 

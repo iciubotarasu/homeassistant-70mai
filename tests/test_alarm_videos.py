@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 
 from custom_components.mai70.const import DOMAIN
@@ -159,12 +159,13 @@ async def test_each_event_in_one_poll_reaches_automations(hass: HomeAssistant) -
         client.files[fid] = _file(fid, f"https://x/{n}.MP4")
 
     seen: list = []
-    hass.bus.async_listen(
-        "state_changed",
-        lambda e: seen.append(e.data["new_state"].attributes.get("event_type"))
-        if e.data["entity_id"] == entity_id
-        else None,
-    )
+
+    @callback
+    def _listener(event) -> None:
+        if event.data["entity_id"] == entity_id:
+            seen.append(event.data["new_state"].attributes.get("event_type"))
+
+    hass.bus.async_listen("state_changed", _listener)
     response = await hass.services.async_call(
         DOMAIN, "fetch_alarm_videos", {}, blocking=True, return_response=True
     )

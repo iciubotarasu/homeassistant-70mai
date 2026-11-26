@@ -39,6 +39,7 @@ PLATFORMS: list[Platform] = [
     Platform.EVENT,
     Platform.IMAGE,
     Platform.SENSOR,
+    Platform.SWITCH,
 ]
 
 
@@ -71,8 +72,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     coordinator = Mai70Coordinator(
-        hass, client, entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD]
+        hass,
+        client,
+        entry.data[CONF_EMAIL],
+        entry.data[CONF_PASSWORD],
+        entry_id=entry.entry_id,
     )
+    await coordinator.async_load_state()
     await coordinator.async_config_entry_first_refresh()
     # Needs the device list from the main coordinator's first refresh.
     await coordinator.position_coordinator.async_config_entry_first_refresh()
@@ -86,5 +92,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
-        hass.data[DOMAIN].pop(entry.entry_id)
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id)
+        await coordinator.async_shutdown_extras()
     return unloaded

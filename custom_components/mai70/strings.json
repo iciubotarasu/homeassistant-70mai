@@ -65,6 +65,9 @@
     "image": {
       "parking_photo": {
         "name": "Parking photo"
+      },
+      "last_alarm": {
+        "name": "Last alarm"
       }
     },
     "event": {
@@ -74,10 +77,16 @@
           "event_type": {
             "state": {
               "alarm": "Alarm",
+              "alarm_update": "Collision resolved",
               "video": "Alarm video ready"
             }
           }
         }
+      }
+    },
+    "switch": {
+      "cloud_upload": {
+        "name": "Cloud upload"
       }
     }
   },

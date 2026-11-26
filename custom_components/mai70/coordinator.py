@@ -8,10 +8,21 @@ import time
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .const import (
+    ALARM_COLLISION,
+    ALARM_SCAN_INTERVAL,
+    ALARM_SCAN_INTERVAL_PUSH,
+    COLLISION_BOARDING,
+    COLLISION_CONFIRMED,
+    COLLISION_TRACK_TIMEOUT,
+    DETAIL_REFRESH_INTERVAL,
+    STATIC_REFRESH_INTERVAL,
+    alarm_name,
     BATTERY_KEY_INDEX,
     BATTERY_SMART_TYPE,
     DEFAULT_SCAN_INTERVAL,
@@ -47,6 +58,18 @@ _ALARM_ID_KEYS = ("id", "alarmId")
 # alarm is dropped.
 _VIDEO_PARTIAL_AFTER = timedelta(minutes=30)
 _VIDEO_GIVE_UP = timedelta(hours=2)
+
+# Alarm-list polls overlap the previous one by this much: an alarm can be
+# listed with a timestamp a little older than when it became visible, and
+# the seen-ids set drops the duplicates the overlap brings back.
+_ALARM_POLL_OVERLAP = timedelta(minutes=10)
+# How far back the alarm list is read after a restart or a long outage, at
+# most. Also how long seen alarm ids are remembered.
+_ALARM_LOOKBACK = timedelta(days=1)
+_SEEN_RETENTION = timedelta(days=3)
+
+_STORE_VERSION = 1
+_STORE_SAVE_DELAY = 10  # seconds
 
 
 def _parse_attachments(alarm: Dict[str, Any]) -> Dict[str, str]:
@@ -107,13 +130,30 @@ def _is_session_invalidated(resp: Any) -> bool:
     return "token" in str(resp.get("errorMessage", "")).lower()
 
 
+def _ms_to_iso(value: Any) -> Optional[str]:
+    try:
+        return dt_util.utc_from_timestamp(int(value) / 1000).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
 def _alarm_summary(alarm_id: str, alarm: Dict[str, Any]) -> Dict[str, Any]:
     """The fields of a getDeviceAlarmList item the alarm/video events carry.
-    alramType's meaning per code isn't confirmed (101 is a collision alarm;
-    the rest are guesses), so the code is passed through as-is."""
+
+    alarm_name/alarm_description are the texts the 70mai app shows for the
+    alarm type (and, for collisions, eventStatus). alarm_time is the
+    server's createTimestamp: happenTime is in the dashcam's own clock,
+    which can be off by hours (timezone, DST), so it is passed through
+    as-is but not used as the alarm's time."""
+    event_status = alarm.get("eventStatus")
+    name, description = alarm_name(alarm.get("alramType"), event_status)
     return {
         "alarm_id": alarm_id,
         "alarm_type": alarm.get("alramType"),
+        "alarm_name": name,
+        "alarm_description": description,
+        "event_status": event_status,
+        "alarm_time": _ms_to_iso(alarm.get("createTimestamp")),
         "happen_time": alarm.get("happenTime"),
         "latitude": alarm.get("coordinatesLat"),
         "longitude": alarm.get("coordinatesLng"),
@@ -128,18 +168,42 @@ class Mai70Coordinator(DataUpdateCoordinator):
     """Polls the 70mai cloud API for every device bound to one account."""
 
     def __init__(
-        self, hass: HomeAssistant, client: MaiClient, email: str, plain_password: str
+        self,
+        hass: HomeAssistant,
+        client: MaiClient,
+        email: str,
+        plain_password: str,
+        entry_id: Optional[str] = None,
     ) -> None:
         super().__init__(
-            hass, _LOGGER, name=DOMAIN, update_interval=DEFAULT_SCAN_INTERVAL
+            hass, _LOGGER, name=DOMAIN, update_interval=ALARM_SCAN_INTERVAL
         )
         self.client = client
         self._email = email
         self._plain_password = plain_password
         self._last_poll_ms: Optional[int] = None
-        self._seen_alarm_ids: Dict[str, set] = {}
+        # device_id -> {alarm_id: createTimestamp ms (or poll time)}
+        self._seen_alarm_ids: Dict[str, Dict[str, int]] = {}
         # device_id -> alarm_id -> pending clip info (see _VIDEO_PARTIAL_AFTER)
         self._pending_videos: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # device_id -> alarm_id -> unresolved collision (see COLLISION_TRACK_TIMEOUT)
+        self._tracked_collisions: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # device_id -> summary of the newest alarm (for the image entity)
+        self._last_alarm: Dict[str, Dict[str, Any]] = {}
+        # (device_id, key) -> (monotonic time fetched, value); see the
+        # *_REFRESH_INTERVAL constants.
+        self._cache: Dict[tuple, tuple] = {}
+        self._devices_cache: Optional[tuple] = None
+        # True until the first poll has run on an install with no saved
+        # state: that poll only records the alarms already there, so a new
+        # install doesn't fire a day's worth of old alarms.
+        self._initial_sync = True
+        self._store: Optional[Store] = (
+            Store(hass, _STORE_VERSION, f"{DOMAIN}.{entry_id}") if entry_id else None
+        )
+        self._push_active = False
+        # async callables run on unload (e.g. stopping the push listener)
+        self._on_shutdown: List[Callable[[], Any]] = []
         # monotonic timestamp of the last detected session invalidation
         # (see _on_session_invalidated), or None if the session is fine.
         self._token_invalid_since: Optional[float] = None
@@ -152,6 +216,106 @@ class Mai70Coordinator(DataUpdateCoordinator):
         # second login would invalidate the first.
         self._api_lock = asyncio.Lock()
         self.position_coordinator = Mai70PositionCoordinator(hass, self)
+
+    # ------------------------------------------------------------------ #
+    # persisted state
+    # ------------------------------------------------------------------ #
+    async def async_load_state(self) -> None:
+        """Restore what was already reported (seen alarm ids, the last poll
+        time, clips and collisions still being waited for, the newest
+        alarm) so a restart neither re-fires old alarms nor misses the ones
+        that happened while Home Assistant was down."""
+        if self._store is None:
+            return
+        data = await self._store.async_load()
+        if not data:
+            return
+        self._initial_sync = False
+        self._last_poll_ms = data.get("last_poll_ms")
+        self._seen_alarm_ids = {
+            dev: {str(k): int(v) for k, v in ids.items()}
+            for dev, ids in (data.get("seen") or {}).items()
+        }
+        self._last_alarm = data.get("last_alarm") or {}
+        now = time.monotonic()
+        # monotonic times don't survive a restart: restart their clocks.
+        for key, target in (("pending_videos", self._pending_videos), ("collisions", self._tracked_collisions)):
+            for dev, items in (data.get(key) or {}).items():
+                target[dev] = {
+                    aid: {**item, "first_seen": now} for aid, item in items.items()
+                }
+
+    @callback
+    def _state_for_store(self) -> Dict[str, Any]:
+        def _strip(groups: Dict[str, Dict[str, Dict[str, Any]]]) -> Dict[str, Any]:
+            return {
+                dev: {aid: {k: v for k, v in item.items() if k != "first_seen"} for aid, item in items.items()}
+                for dev, items in groups.items()
+            }
+
+        return {
+            "last_poll_ms": self._last_poll_ms,
+            "seen": self._seen_alarm_ids,
+            "last_alarm": self._last_alarm,
+            "pending_videos": _strip(self._pending_videos),
+            "collisions": _strip(self._tracked_collisions),
+        }
+
+    async def async_shutdown_extras(self) -> None:
+        """Save state now and stop push (see push.py), on unload."""
+        for stop in list(self._on_shutdown):
+            await stop()
+        await self.async_save_state()
+
+    async def async_save_state(self) -> None:
+        if self._store is not None:
+            await self._store.async_save(self._state_for_store())
+
+    @callback
+    def _schedule_save(self) -> None:
+        if self._store is not None:
+            self._store.async_delay_save(self._state_for_store, _STORE_SAVE_DELAY)
+
+    @callback
+    def set_push_active(self, active: bool) -> None:
+        """While push delivers alarms, the alarm poll is only a safety net."""
+        self._push_active = active
+        self.update_interval = ALARM_SCAN_INTERVAL_PUSH if active else ALARM_SCAN_INTERVAL
+
+    @property
+    def push_active(self) -> bool:
+        return self._push_active
+
+    async def _cached(
+        self,
+        device_id: str,
+        key: str,
+        max_age: timedelta,
+        fetch: Callable[[], Any],
+    ) -> Any:
+        """fetch()'s result, re-fetched only once the cached one is older
+        than max_age. A failed fetch (None) keeps the previous value."""
+        now = time.monotonic()
+        hit = self._cache.get((device_id, key))
+        if hit is not None and now - hit[0] < max_age.total_seconds():
+            return hit[1]
+        value = await fetch()
+        if value is None and hit is not None:
+            # Retry sooner than max_age, but not on every 1-minute run.
+            self._cache[(device_id, key)] = (now - max_age.total_seconds() + 60, hit[1])
+            return hit[1]
+        self._cache[(device_id, key)] = (now, value)
+        return value
+
+    @callback
+    def invalidate_cache(self, device_id: Optional[str] = None, key: Optional[str] = None) -> None:
+        """Drop one cached value, or (no arguments) everything cached so the
+        next poll reads it all again."""
+        if device_id is None:
+            self._cache.clear()
+            self._devices_cache = None
+        else:
+            self._cache.pop((device_id, key), None)
 
     async def _async_ensure_logged_in(self) -> None:
         async with self._api_lock:
@@ -213,13 +377,30 @@ class Mai70Coordinator(DataUpdateCoordinator):
         return resp
 
     async def _async_update_data(self) -> Dict[str, Dict[str, Any]]:
-        device_list = await self._async_get_all_devices()
+        try:
+            await self._async_ensure_logged_in()
+        except MaiError as exc:
+            raise UpdateFailed(str(exc)) from exc
+        now_mono = time.monotonic()
+        if (
+            self._devices_cache is None
+            or now_mono - self._devices_cache[0] >= DETAIL_REFRESH_INTERVAL.total_seconds()
+        ):
+            self._devices_cache = (now_mono, await self._async_get_all_devices())
+        device_list = self._devices_cache[1]
 
         now_ms = int(datetime.now().timestamp() * 1000)
-        begin_ms = self._last_poll_ms or (now_ms - int(timedelta(days=1).total_seconds() * 1000))
-        country_code = await self._async_get_country_code()
+        lookback_ms = now_ms - int(_ALARM_LOOKBACK.total_seconds() * 1000)
+        begin_ms = max(
+            (self._last_poll_ms or lookback_ms) - int(_ALARM_POLL_OVERLAP.total_seconds() * 1000),
+            lookback_ms,
+        )
+        country_code = await self._cached(
+            "", "country", STATIC_REFRESH_INTERVAL, self._async_get_country_code
+        )
 
         result: Dict[str, Dict[str, Any]] = {}
+        alarms_ok = True
         for device in device_list:
             if not isinstance(device, dict):
                 continue
@@ -227,24 +408,78 @@ class Mai70Coordinator(DataUpdateCoordinator):
             if not device_id:
                 _LOGGER.debug("Skipping device with no recognizable id: %r", device)
                 continue
+            new_alarms = await self._async_get_new_alarms(device_id, begin_ms, now_ms)
+            if new_alarms is None:
+                alarms_ok = False
+                new_alarms = []
             result[device_id] = {
                 "meta": device,
                 "name": _first_present(device, _DEVICE_NAME_KEYS) or device_id,
                 # No "position" here: Mai70PositionCoordinator polls it.
-                **await self._async_get_battery(device_id),
-                "new_alarms": await self._async_get_new_alarms(device_id, begin_ms, now_ms),
+                **await self._cached(
+                    device_id,
+                    "battery",
+                    DETAIL_REFRESH_INTERVAL,
+                    lambda d=device_id: self._async_get_battery(d),
+                ),
+                "new_alarms": new_alarms,
+                "alarm_updates": await self._async_check_collisions(device_id),
                 "new_videos": await self._async_resolve_pending_videos(device_id),
-                "dashcam_detail": await self._async_get_dashcam_detail(device_id),
-                "cellular": await self._async_get_cellular_info(device_id),
+                "last_alarm": self._last_alarm.get(device_id),
+                "dashcam_detail": await self._cached(
+                    device_id,
+                    "detail",
+                    DETAIL_REFRESH_INTERVAL,
+                    lambda d=device_id: self._async_get_dashcam_detail(d),
+                ),
+                "cellular": await self._cached(
+                    device_id,
+                    "cellular",
+                    STATIC_REFRESH_INTERVAL,
+                    lambda d=device_id: self._async_get_cellular_info(d),
+                ),
                 "country_code": country_code,
-                "firmware": await self._async_get_firmware_info(device_id, device),
-                "network_status": await self._async_get_network_status(device_id),
-                "device_switch": await self._async_get_device_switch(device_id),
-                "sim_out_power": await self._async_get_sim_out_power(device_id),
+                "firmware": await self._cached(
+                    device_id,
+                    "firmware",
+                    STATIC_REFRESH_INTERVAL,
+                    lambda d=device_id, dev=device: self._async_get_firmware_info(d, dev),
+                ),
+                "network_status": await self._cached(
+                    device_id,
+                    "network",
+                    DETAIL_REFRESH_INTERVAL,
+                    lambda d=device_id: self._async_get_network_status(d),
+                ),
+                "device_switch": await self._cached(
+                    device_id,
+                    "switch",
+                    STATIC_REFRESH_INTERVAL,
+                    lambda d=device_id: self._async_get_device_switch(d),
+                ),
+                "sim_out_power": await self._cached(
+                    device_id,
+                    "sim_out_power",
+                    STATIC_REFRESH_INTERVAL,
+                    lambda d=device_id: self._async_get_sim_out_power(d),
+                ),
             }
 
-        self._last_poll_ms = now_ms
+        # Only move the alarm window forward once every device's alarm list
+        # was actually read: a failed read (e.g. the session was just
+        # invalidated) would otherwise skip that stretch of alarms for good.
+        if alarms_ok:
+            self._last_poll_ms = now_ms
+            self._initial_sync = False
+        self._prune_seen(now_ms)
+        self._schedule_save()
         return result
+
+    def _prune_seen(self, now_ms: int) -> None:
+        cutoff = now_ms - int(_SEEN_RETENTION.total_seconds() * 1000)
+        for ids in self._seen_alarm_ids.values():
+            for alarm_id in [a for a, ts in ids.items() if ts < cutoff]:
+                del ids[alarm_id]
 
     async def _async_get_device_page(
         self, last_bind_time: Optional[int]
@@ -528,13 +763,12 @@ class Mai70Coordinator(DataUpdateCoordinator):
 
     async def _async_get_new_alarms(
         self, device_id: str, begin_ms: int, now_ms: int
-    ) -> List[Dict[str, Any]]:
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Alarms not reported yet, oldest first; None if the list couldn't
+        be read."""
         try:
             # No alarm_types filter: 70mai's own app doesn't filter its
-            # alarm-list screen by type either, and the confirmed observed
-            # types (101 collision, 104/105/107) don't match the guessed
-            # [105, 108] this used to send - that guess risked silently
-            # dropping real alarms like collisions (101).
+            # alarm-list screen by type either.
             resp = await self._async_call(
                 self.client.get_device_alarm_list,
                 device_id,
@@ -543,29 +777,97 @@ class Mai70Coordinator(DataUpdateCoordinator):
             )
         except MaiError as exc:
             _LOGGER.debug("getDeviceAlarmList failed for %s: %s", device_id, exc)
-            return []
+            return None
         alarms = resp.get("resultBodyObject")
+        if alarms is None:
+            alarms = []
         if not isinstance(alarms, list):
-            return []
+            return None
 
-        seen = self._seen_alarm_ids.setdefault(device_id, set())
+        seen = self._seen_alarm_ids.setdefault(device_id, {})
         new_alarms = []
-        for alarm in alarms:
-            if not isinstance(alarm, dict):
-                continue
+        for alarm in sorted(
+            (a for a in alarms if isinstance(a, dict)),
+            key=lambda a: a.get("createTimestamp") or a.get("happenTime") or 0,
+        ):
             alarm_id = _first_present(alarm, _ALARM_ID_KEYS)
             if alarm_id is None or alarm_id in seen:
                 continue
-            seen.add(alarm_id)
-            new_alarms.append(_alarm_summary(alarm_id, alarm))
-            files = _parse_attachments(alarm)
-            if files:
-                self._pending_videos.setdefault(device_id, {})[alarm_id] = {
-                    "alarm": new_alarms[-1],
-                    "files": files,
-                    "first_seen": time.monotonic(),
-                }
+            seen[alarm_id] = int(alarm.get("createTimestamp") or now_ms)
+            summary = _alarm_summary(alarm_id, alarm)
+            self._remember_last_alarm(device_id, summary)
+            if self._initial_sync:
+                # A new install: record what's already there, report nothing.
+                continue
+            new_alarms.append(summary)
+            self._track_alarm(device_id, alarm_id, alarm, summary)
         return new_alarms
+
+    def _track_alarm(
+        self, device_id: str, alarm_id: str, alarm: Dict[str, Any], summary: Dict[str, Any]
+    ) -> None:
+        """Queue an alarm's clips, and keep an unresolved collision under
+        watch until 70mai settles it."""
+        files = _parse_attachments(alarm)
+        if files and alarm_id not in self._pending_videos.get(device_id, {}):
+            self._pending_videos.setdefault(device_id, {})[alarm_id] = {
+                "alarm": summary,
+                "files": files,
+                "first_seen": time.monotonic(),
+            }
+        if alarm.get("alramType") == ALARM_COLLISION and alarm.get("eventStatus") not in (
+            COLLISION_BOARDING,
+            COLLISION_CONFIRMED,
+        ):
+            self._tracked_collisions.setdefault(device_id, {})[alarm_id] = {
+                "alarm": summary,
+                "first_seen": time.monotonic(),
+            }
+
+    def _remember_last_alarm(self, device_id: str, summary: Dict[str, Any]) -> None:
+        """The newest alarm worth showing (not a "normal boarding" one)."""
+        if summary.get("alarm_type") == ALARM_COLLISION and summary.get("event_status") == COLLISION_BOARDING:
+            return
+        previous = self._last_alarm.get(device_id)
+        if previous and (previous.get("alarm_time") or "") > (summary.get("alarm_time") or ""):
+            return
+        self._last_alarm[device_id] = {k: v for k, v in summary.items() if k != "raw"}
+
+    async def _async_check_collisions(self, device_id: str) -> List[Dict[str, Any]]:
+        """Collisions 70mai has resolved since the last poll, as updated
+        summaries (event_status 2 = normal boarding, 3 = confirmed)."""
+        tracked = self._tracked_collisions.get(device_id)
+        if not tracked:
+            return []
+        updates: List[Dict[str, Any]] = []
+        now = time.monotonic()
+        for alarm_id in list(tracked):
+            entry = tracked[alarm_id]
+            try:
+                resp = await self._async_call(self.client.get_device_alarm, device_id, alarm_id)
+            except MaiError as exc:
+                _LOGGER.debug("getDeviceAlarm failed for %s/%s: %s", device_id, alarm_id, exc)
+                continue
+            alarm = resp.get("resultBodyObject")
+            if isinstance(alarm, dict) and alarm.get("eventStatus") in (
+                COLLISION_BOARDING,
+                COLLISION_CONFIRMED,
+            ):
+                summary = _alarm_summary(alarm_id, alarm)
+                updates.append(summary)
+                del tracked[alarm_id]
+                if alarm.get("eventStatus") == COLLISION_CONFIRMED:
+                    self._remember_last_alarm(device_id, summary)
+                    self._track_alarm(device_id, alarm_id, alarm, summary)
+                elif (self._last_alarm.get(device_id) or {}).get("alarm_id") == alarm_id:
+                    # It was the owner getting in: not worth showing.
+                    self._last_alarm[device_id] = {
+                        k: v for k, v in summary.items() if k != "raw"
+                    }
+            elif now - entry["first_seen"] >= COLLISION_TRACK_TIMEOUT.total_seconds():
+                _LOGGER.debug("Collision %s of %s never resolved", alarm_id, device_id)
+                del tracked[alarm_id]
+        return updates
 
     async def async_requeue_alarm_videos(self, hours: float) -> int:
         """Queue the clips of every alarm from the last `hours` again, even
@@ -599,7 +901,9 @@ class Mai70Coordinator(DataUpdateCoordinator):
                 files = _parse_attachments(alarm)
                 if alarm_id is None or not files:
                     continue
-                self._seen_alarm_ids.setdefault(device_id, set()).add(alarm_id)
+                self._seen_alarm_ids.setdefault(device_id, {})[alarm_id] = int(
+                    alarm.get("createTimestamp") or now_ms
+                )
                 self._pending_videos.setdefault(device_id, {})[alarm_id] = {
                     "alarm": _alarm_summary(alarm_id, alarm),
                     "files": files,
@@ -653,6 +957,11 @@ class Mai70Coordinator(DataUpdateCoordinator):
             if complete or (videos and age >= _VIDEO_PARTIAL_AFTER):
                 ready.append({**entry["alarm"], "videos": videos, "complete": complete})
                 del pending[alarm_id]
+                last = self._last_alarm.get(device_id)
+                if last and last.get("alarm_id") == alarm_id:
+                    main = videos.get("front_video") or next(iter(videos.values()))
+                    last["video_url"] = main.get("url")
+                    last["cover_url"] = last.get("cover_url") or main.get("cover_url")
             elif age >= _VIDEO_GIVE_UP:
                 _LOGGER.debug("Giving up on clips for alarm %s of %s", alarm_id, device_id)
                 del pending[alarm_id]

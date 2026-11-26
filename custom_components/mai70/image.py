@@ -27,6 +27,12 @@ async def async_setup_entry(
         entity_factory=lambda device_id: Mai70ParkingPhotoImage(coordinator, device_id, hass),
         should_add=lambda data: (data.get("position") or {}).get("park_pic_url") is not None,
     )
+    async_setup_dynamic_entities(
+        main,
+        async_add_entities,
+        entity_factory=lambda device_id: Mai70LastAlarmImage(main, device_id, hass),
+        should_add=lambda data: bool((data.get("last_alarm") or {}).get("cover_url")),
+    )
 
 
 class Mai70ParkingPhotoImage(Mai70Entity, ImageEntity):
@@ -64,4 +70,47 @@ class Mai70ParkingPhotoImage(Mai70Entity, ImageEntity):
         return {
             # "parkingPhotoSwitch"'s exact meaning isn't documented.
             "parking_photo_switch": self._position.get("parking_photo_switch"),
+        }
+
+
+class Mai70LastAlarmImage(Mai70Entity, ImageEntity):
+    """Preview picture of the newest alarm (its cover image), with the
+    alarm's name, time and clip URL as attributes. "Normal boarding"
+    collisions (the owner getting in) don't replace it."""
+
+    _attr_translation_key = "last_alarm"
+    _attr_icon = "mdi:cctv"
+
+    def __init__(self, coordinator: Mai70Coordinator, device_id: str, hass: HomeAssistant) -> None:
+        Mai70Entity.__init__(self, coordinator, device_id)
+        ImageEntity.__init__(self, hass)
+        self._attr_unique_id = f"{device_id}_last_alarm"
+
+    @property
+    def _alarm(self) -> Dict[str, Any]:
+        return self._device_data.get("last_alarm") or {}
+
+    @property
+    def image_url(self) -> Optional[str]:
+        return self._alarm.get("cover_url") or self._alarm.get("picture_url")
+
+    @property
+    def image_last_updated(self) -> Optional[datetime]:
+        return dt_util.parse_datetime(self._alarm.get("alarm_time") or "")
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        alarm = self._alarm
+        return {
+            key: alarm.get(key)
+            for key in (
+                "alarm_id",
+                "alarm_type",
+                "alarm_name",
+                "event_status",
+                "alarm_time",
+                "latitude",
+                "longitude",
+                "video_url",
+            )
         }

@@ -86,7 +86,10 @@ async def _advance(hass: HomeAssistant, delta: timedelta) -> None:
 
 
 def _non_position_calls(client: FakeMaiClient) -> int:
-    return sum(1 for name, _ in client.calls if name != "get_position")
+    # The alarm list is polled every minute on its own (ALARM_SCAN_INTERVAL).
+    return sum(
+        1 for name, _ in client.calls if name not in ("get_position", "get_device_alarm_list")
+    )
 
 
 async def test_tracker_is_fed_by_position_poll_only(
@@ -215,8 +218,10 @@ async def test_new_device_gets_tracker_from_position_poll(
     fake_client.devices.append({"deviceId": "dev2", "nickName": "Van"})
     fake_client.positions["dev2"] = position_body(lat="41.900000", lng="12.500000")
 
-    # Bound after setup: the main poll discovers it, the position poll then
-    # fetches its position and the tracker appears.
+    # Bound after setup: the main poll discovers it (once the cached device
+    # list expires), the position poll then fetches its position and the
+    # tracker appears.
+    _main(hass, entry).invalidate_cache()
     await _main(hass, entry).async_refresh()
     await _advance(hass, POSITION_SCAN_INTERVAL_ACTIVE)
 
