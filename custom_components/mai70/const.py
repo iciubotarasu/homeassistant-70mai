@@ -12,6 +12,8 @@ CONF_BASE_URL = "base_url"
 # Config-flow-only field: one of SERVER_CHOICES' keys, SERVER_AUTO, or a
 # server address typed by hand (the selector accepts custom values).
 CONF_SERVER = "server"
+# Options-flow key: receive alarms by Firebase push (push.py). On by default.
+CONF_PUSH = "push"
 
 # 70mai account data lives on one regional server, and a login against the
 # wrong one fails like a bad password. Known hosts (2026-11):

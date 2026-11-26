@@ -60,6 +60,9 @@
       },
       "sim_out_power": {
         "name": "SIM external power support"
+      },
+      "push_connected": {
+        "name": "Push connected"
       }
     },
     "image": {
@@ -108,6 +111,17 @@
         "hours": {
           "name": "Hours",
           "description": "How far back to look for alarms."
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "70mai",
+        "description": "Push: Home Assistant receives 70mai alarm notifications within seconds. While on, the 70mai phone app no longer gets alarm pushes (70mai sends them to one device per account).",
+        "data": {
+          "push": "Receive alarms by push"
         }
       }
     }

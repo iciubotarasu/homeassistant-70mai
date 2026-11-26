@@ -78,6 +78,8 @@ class FakeMaiClient:
 
     def __init__(self) -> None:
         self.token: Optional[str] = None
+        self.device_token: Optional[str] = None
+        self.login_device_types: List[int] = []
         self.login_delay_s = 0.0
         self.login_calls = 0
         self.devices: List[Dict[str, Any]] = [{"deviceId": DEVICE_ID, "nickName": DEVICE_NAME}]
@@ -90,8 +92,9 @@ class FakeMaiClient:
     def call_count(self, name: str) -> int:
         return sum(1 for call_name, _ in self.calls if call_name == name)
 
-    def login(self, email: str, plain_password: str) -> Dict[str, Any]:
+    def login(self, email: str, plain_password: str, device_type: int = 3) -> Dict[str, Any]:
         self.login_calls += 1
+        self.login_device_types.append(device_type)
         if self.login_delay_s:
             time.sleep(self.login_delay_s)
         self.token = "token"
@@ -143,7 +146,9 @@ def fake_client() -> FakeMaiClient:
     return FakeMaiClient()
 
 
-async def setup_integration(hass: HomeAssistant, client: FakeMaiClient) -> MockConfigEntry:
+async def setup_integration(
+    hass: HomeAssistant, client: FakeMaiClient, options: Optional[Dict[str, Any]] = None
+) -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="user@example.com",
@@ -153,6 +158,8 @@ async def setup_integration(hass: HomeAssistant, client: FakeMaiClient) -> MockC
             CONF_PASSWORD: "password",
             CONF_UUID: "00000000-0000-0000-0000-000000000000",
         },
+        # Push needs Firebase (network): tested on its own in test_push.py.
+        options=options if options is not None else {"push": False},
     )
     entry.add_to_hass(hass)
     with patch("custom_components.mai70.MaiClient", return_value=client):

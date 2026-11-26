@@ -18,8 +18,9 @@ from homeassistant.helpers.typing import ConfigType
 
 from client70mai import MaiClient
 
-from .const import CONF_BASE_URL, CONF_UUID, DOMAIN, SERVER_EU
+from .const import CONF_BASE_URL, CONF_PUSH, CONF_UUID, DOMAIN, SERVER_EU
 from .coordinator import Mai70Coordinator
+from .push import Mai70Push
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -85,7 +86,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+    if entry.options.get(CONF_PUSH, True):
+        push = Mai70Push(hass, coordinator, entry.entry_id)
+        coordinator.push = push
+        coordinator._on_shutdown.append(push.async_stop)
+        # In the background: Firebase registration takes a few seconds and
+        # must not hold up setup; polling works meanwhile.
+        entry.async_create_background_task(hass, push.async_start(), f"{DOMAIN}_push_start")
     return True
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

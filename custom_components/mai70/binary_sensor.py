@@ -9,7 +9,7 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import CONF_PUSH, DOMAIN
 from .coordinator import Mai70Coordinator
 from .entity import Mai70Entity, async_setup_dynamic_entities
 
@@ -31,13 +31,18 @@ async def async_setup_entry(
         entity_factory=lambda device_id: Mai70SimOutPowerSensor(coordinator, device_id),
         should_add=lambda data: data.get("sim_out_power") is not None,
     )
+    if entry.options.get(CONF_PUSH, True):
+        async_setup_dynamic_entities(
+            coordinator,
+            async_add_entities,
+            entity_factory=lambda device_id: Mai70PushConnectedSensor(coordinator, device_id),
+        )
 
 
 class Mai70MonitorVideoUploadSensor(Mai70Entity, BinarySensorEntity):
     """Whether the "monitor video" cloud-upload switch is on, from
     getDeviceSwitch's confirmed monitorVedioUpload field (sic - verbatim
-    API typo). Read-only: this integration doesn't call setDeviceSwitch,
-    so toggling it from the 70mai app is the only way to change it today.
+    API typo). Read-only; the cloud upload switch entity changes it.
     """
 
     _attr_translation_key = "monitor_video_upload"
@@ -81,3 +86,30 @@ class Mai70SimOutPowerSensor(Mai70Entity, BinarySensorEntity):
     @property
     def is_on(self) -> Optional[bool]:
         return self._device_data.get("sim_out_power")
+
+
+class Mai70PushConnectedSensor(Mai70Entity, BinarySensorEntity):
+    """Whether alarms arrive by Firebase push (push.py) right now; the last
+    push received is in the attributes."""
+
+    _attr_translation_key = "push_connected"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:bell-ring-outline"
+
+    def __init__(self, coordinator: Mai70Coordinator, device_id: str) -> None:
+        super().__init__(coordinator, device_id)
+        self._attr_unique_id = f"{device_id}_push_connected"
+
+    @property
+    def available(self) -> bool:
+        # Diagnostic of the push link itself, not of the poll.
+        return True
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.push_active
+
+    @property
+    def extra_state_attributes(self) -> Dict[str, Any]:
+        push = self.coordinator.push
+        return {"last_push": push.last_message if push else None}

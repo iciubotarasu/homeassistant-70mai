@@ -202,6 +202,8 @@ class Mai70Coordinator(DataUpdateCoordinator):
             Store(hass, _STORE_VERSION, f"{DOMAIN}.{entry_id}") if entry_id else None
         )
         self._push_active = False
+        self._login_device_type = 3
+        self.push: Any = None  # push.Mai70Push, set up by __init__.py
         # async callables run on unload (e.g. stopping the push listener)
         self._on_shutdown: List[Callable[[], Any]] = []
         # monotonic timestamp of the last detected session invalidation
@@ -281,6 +283,7 @@ class Mai70Coordinator(DataUpdateCoordinator):
         """While push delivers alarms, the alarm poll is only a safety net."""
         self._push_active = active
         self.update_interval = ALARM_SCAN_INTERVAL_PUSH if active else ALARM_SCAN_INTERVAL
+        self.async_update_listeners()
 
     @property
     def push_active(self) -> bool:
@@ -317,6 +320,59 @@ class Mai70Coordinator(DataUpdateCoordinator):
         else:
             self._cache.pop((device_id, key), None)
 
+    async def _async_login_locked(self) -> None:
+        """Log in (caller holds _api_lock). With a push token, log in as the
+        Android app (deviceType 2, like the 70mai Android app's channel
+        2001xxx) so 70mai sends alarm pushes through Firebase; fall back to
+        the default device type if 70mai refuses that."""
+        if self.client.device_token and self._login_device_type == 2:
+            try:
+                await self.hass.async_add_executor_job(
+                    self.client.login, self._email, self._plain_password, 2
+                )
+                return
+            except MaiError as exc:
+                _LOGGER.warning(
+                    "70mai refused an Android-type login (%s); using the default one", exc
+                )
+                self._login_device_type = 3
+        await self.hass.async_add_executor_job(
+            self.client.login, self._email, self._plain_password
+        )
+        if self.client.device_token:
+            # userLoginPwd's deviceToken may be ignored for this device type:
+            # register it explicitly as well.
+            resp = await self.hass.async_add_executor_job(
+                self.client.update_device_token, self.client.device_token
+            )
+            _LOGGER.debug("updateDeviceToken after login: %s", resp)
+
+    async def async_set_push_token(self, token: str) -> bool:
+        """Hand 70mai the Firebase token: logs in again so the token goes
+        with the login (as the app does), and registers it with
+        updateDeviceToken. True if 70mai accepted it."""
+        self.client.device_token = token
+        self._login_device_type = 2
+        async with self._api_lock:
+            try:
+                await self._async_login_locked()
+                resp = await self.hass.async_add_executor_job(
+                    self.client.update_device_token, token
+                )
+            except MaiError as exc:
+                _LOGGER.warning("70mai push: registering the token failed: %s", exc)
+                return False
+        _LOGGER.info(
+            "70mai push: token registered (login deviceType %s, updateDeviceToken: %s)",
+            self._login_device_type,
+            resp.get("resultBodyObject") if isinstance(resp, dict) else resp,
+        )
+        return bool(isinstance(resp, dict) and not resp.get("error"))
+
+    async def async_refresh_from_push(self) -> None:
+        """A push arrived: read the alarm list now (debounced)."""
+        await self.async_request_refresh()
+
     async def _async_ensure_logged_in(self) -> None:
         async with self._api_lock:
             if self.client.token:
@@ -333,9 +389,7 @@ class Mai70Coordinator(DataUpdateCoordinator):
                         "logging in again too soon would just kick out whatever "
                         "else is currently using the account."
                     )
-            await self.hass.async_add_executor_job(
-                self.client.login, self._email, self._plain_password
-            )
+            await self._async_login_locked()
             if self._token_invalid_since is not None:
                 _LOGGER.warning(
                     "70mai login succeeded again after the earlier session "

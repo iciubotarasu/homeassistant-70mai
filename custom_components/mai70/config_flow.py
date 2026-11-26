@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.selector import (
     SelectSelector,
@@ -20,6 +21,7 @@ from client70mai.exceptions import MaiConnectionError, MaiError, MaiTimeoutError
 
 from .const import (
     CONF_BASE_URL,
+    CONF_PUSH,
     CONF_SERVER,
     CONF_UUID,
     DOMAIN,
@@ -71,6 +73,25 @@ def resolve_servers(server: str) -> List[str]:
     return [normalize_server(server)]
 
 
+class Mai70OptionsFlow(config_entries.OptionsFlow):
+    """Push on/off (see push.py: while on, the phone app stops getting
+    70mai's alarm pushes, Home Assistant gets them instead)."""
+
+    async def async_step_init(self, user_input=None):
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_PUSH, default=self.config_entry.options.get(CONF_PUSH, True)
+                    ): bool
+                }
+            ),
+        )
+
+
 class Mai70ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for 70mai."""
 
@@ -113,6 +134,11 @@ class Mai70ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     )
                 return base_url, None
         return None, "invalid_auth" if reached_server else "cannot_connect"
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        return Mai70OptionsFlow()
 
     async def async_step_user(
         self, user_input: Optional[Dict[str, Any]] = None
