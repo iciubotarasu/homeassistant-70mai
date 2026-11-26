@@ -181,3 +181,32 @@ async def test_last_alarm_image_from_initial_sync(hass: HomeAssistant) -> None:
     await setup_integration(hass, client)
     entity_id = er.async_get(hass).async_get_entity_id("image", DOMAIN, f"{DEVICE_ID}_last_alarm")
     assert entity_id is not None
+
+
+async def test_purge_media(hass: HomeAssistant, tmp_path) -> None:
+    import os
+    import time as t
+
+    import pytest
+    import voluptuous as vol
+
+    media = tmp_path / "media"
+    old_dir = media / "70mai" / "2026-10-01"
+    new_dir = media / "70mai" / "2026-11-26"
+    old_dir.mkdir(parents=True)
+    new_dir.mkdir(parents=True)
+    (old_dir / "a.mp4").write_bytes(b"x" * 10)
+    (new_dir / "b.mp4").write_bytes(b"y")
+    past = t.time() - 40 * 86400
+    os.utime(old_dir / "a.mp4", (past, past))
+    hass.config.media_dirs = {"local": str(media)}
+
+    await setup_integration(hass, Client())
+    result = await hass.services.async_call(
+        DOMAIN, "purge_media", {"folder": str(media / "70mai"), "days": 30}, blocking=True, return_response=True
+    )
+    assert result == {"deleted_files": 1, "freed_bytes": 10}
+    assert not old_dir.exists() and (new_dir / "b.mp4").exists()
+
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(DOMAIN, "purge_media", {"folder": "/etc", "days": 30}, blocking=True, return_response=True)

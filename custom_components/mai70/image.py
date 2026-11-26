@@ -31,7 +31,7 @@ async def async_setup_entry(
         main,
         async_add_entities,
         entity_factory=lambda device_id: Mai70LastAlarmImage(main, device_id, hass),
-        should_add=lambda data: bool((data.get("last_alarm") or {}).get("cover_url")),
+        should_add=lambda data: bool(data.get("last_picture_alarm")),
     )
 
 
@@ -74,9 +74,10 @@ class Mai70ParkingPhotoImage(Mai70Entity, ImageEntity):
 
 
 class Mai70LastAlarmImage(Mai70Entity, ImageEntity):
-    """Preview picture of the newest alarm (its cover image), with the
-    alarm's name, time and clip URL as attributes. "Normal boarding"
-    collisions (the owner getting in) don't replace it."""
+    """Preview picture of the newest alarm that has one (its cover image,
+    or its clip's cover once uploaded), with that alarm's name, time and
+    clip URL as attributes. "Normal boarding" collisions (the owner
+    getting in) don't replace it."""
 
     _attr_translation_key = "last_alarm"
     _attr_icon = "mdi:cctv"
@@ -88,7 +89,7 @@ class Mai70LastAlarmImage(Mai70Entity, ImageEntity):
 
     @property
     def _alarm(self) -> Dict[str, Any]:
-        return self._device_data.get("last_alarm") or {}
+        return self._device_data.get("last_picture_alarm") or {}
 
     @property
     def image_url(self) -> Optional[str]:

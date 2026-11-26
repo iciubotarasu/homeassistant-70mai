@@ -188,8 +188,11 @@ class Mai70Coordinator(DataUpdateCoordinator):
         self._pending_videos: Dict[str, Dict[str, Dict[str, Any]]] = {}
         # device_id -> alarm_id -> unresolved collision (see COLLISION_TRACK_TIMEOUT)
         self._tracked_collisions: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        # device_id -> summary of the newest alarm (for the image entity)
+        # device_id -> summary of the newest alarm, and of the newest one
+        # with a picture (the image entity)
         self._last_alarm: Dict[str, Dict[str, Any]] = {}
+        self._last_picture: Dict[str, Dict[str, Any]] = {}
+        self._picture_seeded: set = set()
         # (device_id, key) -> (monotonic time fetched, value); see the
         # *_REFRESH_INTERVAL constants.
         self._cache: Dict[tuple, tuple] = {}
@@ -239,6 +242,7 @@ class Mai70Coordinator(DataUpdateCoordinator):
             for dev, ids in (data.get("seen") or {}).items()
         }
         self._last_alarm = data.get("last_alarm") or {}
+        self._last_picture = data.get("last_picture") or {}
         now = time.monotonic()
         # monotonic times don't survive a restart: restart their clocks.
         for key, target in (("pending_videos", self._pending_videos), ("collisions", self._tracked_collisions)):
@@ -259,6 +263,7 @@ class Mai70Coordinator(DataUpdateCoordinator):
             "last_poll_ms": self._last_poll_ms,
             "seen": self._seen_alarm_ids,
             "last_alarm": self._last_alarm,
+            "last_picture": self._last_picture,
             "pending_videos": _strip(self._pending_videos),
             "collisions": _strip(self._tracked_collisions),
         }
@@ -462,6 +467,8 @@ class Mai70Coordinator(DataUpdateCoordinator):
             if not device_id:
                 _LOGGER.debug("Skipping device with no recognizable id: %r", device)
                 continue
+            if device_id not in self._last_picture and device_id not in self._picture_seeded:
+                await self._async_seed_picture(device_id, lookback_ms, now_ms)
             new_alarms = await self._async_get_new_alarms(device_id, begin_ms, now_ms)
             if new_alarms is None:
                 alarms_ok = False
@@ -480,6 +487,7 @@ class Mai70Coordinator(DataUpdateCoordinator):
                 "alarm_updates": await self._async_check_collisions(device_id),
                 "new_videos": await self._async_resolve_pending_videos(device_id),
                 "last_alarm": self._last_alarm.get(device_id),
+                "last_picture_alarm": self._last_picture.get(device_id),
                 "dashcam_detail": await self._cached(
                     device_id,
                     "detail",
@@ -859,6 +867,23 @@ class Mai70Coordinator(DataUpdateCoordinator):
             self._track_alarm(device_id, alarm_id, alarm, summary)
         return new_alarms
 
+    async def _async_seed_picture(self, device_id: str, begin_ms: int, now_ms: int) -> None:
+        """Once per run, if no alarm picture is known yet (e.g. state saved
+        by an older version): look back for the newest alarm with one."""
+        self._picture_seeded.add(device_id)
+        try:
+            resp = await self._async_call(
+                self.client.get_device_alarm_list, device_id, begin_ms, now_ms
+            )
+        except MaiError:
+            return
+        for alarm in resp.get("resultBodyObject") or []:
+            if isinstance(alarm, dict) and (alarm.get("coverUrl") or alarm.get("pictureUrl")):
+                alarm_id = _first_present(alarm, _ALARM_ID_KEYS)
+                if alarm_id is not None:
+                    summary = _alarm_summary(alarm_id, alarm)
+                    self._remember_picture(device_id, {k: v for k, v in summary.items() if k != "raw"})
+
     def _track_alarm(
         self, device_id: str, alarm_id: str, alarm: Dict[str, Any], summary: Dict[str, Any]
     ) -> None:
@@ -884,10 +909,18 @@ class Mai70Coordinator(DataUpdateCoordinator):
         """The newest alarm worth showing (not a "normal boarding" one)."""
         if summary.get("alarm_type") == ALARM_COLLISION and summary.get("event_status") == COLLISION_BOARDING:
             return
+        slim = {k: v for k, v in summary.items() if k != "raw"}
         previous = self._last_alarm.get(device_id)
-        if previous and (previous.get("alarm_time") or "") > (summary.get("alarm_time") or ""):
-            return
-        self._last_alarm[device_id] = {k: v for k, v in summary.items() if k != "raw"}
+        if not previous or (previous.get("alarm_time") or "") <= (slim.get("alarm_time") or ""):
+            self._last_alarm[device_id] = slim
+        if slim.get("cover_url") or slim.get("picture_url"):
+            self._remember_picture(device_id, slim)
+
+    def _remember_picture(self, device_id: str, slim: Dict[str, Any]) -> None:
+        """The newest alarm that has a picture (for the image entity)."""
+        previous = self._last_picture.get(device_id)
+        if not previous or (previous.get("alarm_time") or "") <= (slim.get("alarm_time") or ""):
+            self._last_picture[device_id] = dict(slim)
 
     async def _async_check_collisions(self, device_id: str) -> List[Dict[str, Any]]:
         """Collisions 70mai has resolved since the last poll, as updated
@@ -1013,11 +1046,17 @@ class Mai70Coordinator(DataUpdateCoordinator):
             if complete or (videos and age >= _VIDEO_PARTIAL_AFTER):
                 ready.append({**entry["alarm"], "videos": videos, "complete": complete})
                 del pending[alarm_id]
-                last = self._last_alarm.get(device_id)
-                if last and last.get("alarm_id") == alarm_id:
-                    main = videos.get("front_video") or next(iter(videos.values()))
-                    last["video_url"] = main.get("url")
-                    last["cover_url"] = last.get("cover_url") or main.get("cover_url")
+                main = videos.get("front_video") or next(iter(videos.values()))
+                for store in (self._last_alarm, self._last_picture):
+                    last = store.get(device_id)
+                    if last and last.get("alarm_id") == alarm_id:
+                        last["video_url"] = main.get("url")
+                        last["cover_url"] = last.get("cover_url") or main.get("cover_url")
+                if main.get("cover_url"):
+                    slim = {k: v for k, v in entry["alarm"].items() if k != "raw"}
+                    slim["cover_url"] = slim.get("cover_url") or main.get("cover_url")
+                    slim["video_url"] = main.get("url")
+                    self._remember_picture(device_id, slim)
             elif age >= _VIDEO_GIVE_UP:
                 _LOGGER.debug("Giving up on clips for alarm %s of %s", alarm_id, device_id)
                 del pending[alarm_id]

@@ -113,6 +113,20 @@
           "description": "How far back to look for alarms."
         }
       }
+    },
+    "purge_media": {
+      "name": "Purge old media",
+      "description": "Delete downloaded files (e.g. saved alarm clips) older than the given number of days from a subfolder of a Home Assistant media folder, and remove folders left empty.",
+      "fields": {
+        "folder": {
+          "name": "Folder",
+          "description": "A subfolder of a media folder, e.g. /media/70mai."
+        },
+        "days": {
+          "name": "Days",
+          "description": "Delete files older than this."
+        }
+      }
     }
   },
   "options": {

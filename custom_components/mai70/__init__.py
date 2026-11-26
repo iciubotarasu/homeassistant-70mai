@@ -34,6 +34,43 @@ FETCH_ALARM_VIDEOS_SCHEMA = vol.Schema(
     }
 )
 
+SERVICE_PURGE_MEDIA = "purge_media"
+ATTR_FOLDER = "folder"
+ATTR_DAYS = "days"
+PURGE_MEDIA_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_FOLDER, default="/media/70mai"): cv.string,
+        vol.Optional(ATTR_DAYS, default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=3650)),
+    }
+)
+
+
+def _purge_folder(folder: str, days: int) -> dict:
+    """Delete files older than `days` under `folder`, then empty folders."""
+    import os
+    import time as time_module
+
+    cutoff = time_module.time() - days * 86400
+    deleted, freed = 0, 0
+    for root, _dirs, files in os.walk(folder, topdown=False):
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                st = os.stat(path)
+                if st.st_mtime < cutoff:
+                    os.remove(path)
+                    deleted += 1
+                    freed += st.st_size
+            except OSError:
+                continue
+        if root != folder:
+            try:
+                os.rmdir(root)  # only succeeds when empty
+            except OSError:
+                pass
+    return {"deleted_files": deleted, "freed_bytes": freed}
+
+
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.DEVICE_TRACKER,
@@ -58,6 +95,26 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         SERVICE_FETCH_ALARM_VIDEOS,
         _fetch_alarm_videos,
         schema=FETCH_ALARM_VIDEOS_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    async def _purge_media(call: ServiceCall) -> ServiceResponse:
+        import os
+
+        folder = os.path.realpath(call.data[ATTR_FOLDER])
+        roots = [os.path.realpath(d) for d in hass.config.media_dirs.values()]
+        if not any(folder == r or folder.startswith(r + os.sep) for r in roots) or folder in roots:
+            raise vol.Invalid(
+                f"{folder} must be a subfolder of a media folder ({', '.join(roots)})"
+            )
+        if not os.path.isdir(folder):
+            return {"deleted_files": 0, "freed_bytes": 0}
+        return await hass.async_add_executor_job(_purge_folder, folder, call.data[ATTR_DAYS])
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_PURGE_MEDIA,
+        _purge_media,
+        schema=PURGE_MEDIA_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
     return True
