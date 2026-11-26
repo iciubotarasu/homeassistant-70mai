@@ -51,6 +51,7 @@ field that reliably tells 4G-equipped and WiFi-only devices apart - see
 | Model | 4G/SIM module | Status |
 | ----- | -------------- | ------ |
 | A810  | Yes            | Confirmed working (author's own device). |
+| Omni (X200) | Yes      | Confirmed working: alarms, clips, position, battery, push. |
 
 This is the only model I can personally verify, since it's the only one
 I own. The API itself isn't model-specific, so other 4G-equipped 70mai
@@ -174,6 +175,94 @@ than fighting the app for the session. Check **Settings → System →
 Logs** (or your `configuration.yaml` logger settings for
 `custom_components.mai70`) if you want to see this happening.
 
+## Alarms, clips and push
+
+### Alarm types
+
+The `event` entity carries `alarm_type` (the raw code) plus `alarm_name` and
+`alarm_description`, the texts the 70mai Android app (4.5.0) shows:
+
+| Code | eventStatus | Name |
+|---|---|---|
+| 101 | 1 | Vehicle suspected of collision |
+| 101 | 2 | Normal boarding behavior (the owner got in; collision warning cancelled) |
+| 101 | 3 | Vehicle collision detected (with clip) |
+| 102 | | Vehicle driving out of the geo-fence |
+| 103 | | Remote surveillance video |
+| 104 | | Overheat protection (Dash Cam shut down) |
+| 105 | | Battery protection (battery voltage at the protection value, Dash Cam shut down) |
+| 106 | | Remote surveillance photo |
+| 107 | | Suspicious persons detected (with clip) |
+| 108 | | Parking surveillance global timer (Dash Cam turned off as scheduled) |
+| 109 | | Vehicle entered the geo-fence |
+
+`alarm_time` is the server's `createTimestamp`. `happen_time` is passed
+through as-is but comes from the dashcam's own clock, which can be hours off.
+
+### Event types
+
+- `alarm`: a new alarm.
+- `alarm_update`: a collision first reported as suspected (101/1) was
+  resolved by 70mai: `event_status` 2 (normal boarding) or 3 (confirmed).
+- `video`: the alarm's clips were uploaded. `video_url` (front camera) and
+  `videos` (`front_video`, `backend_video`, each with `url`, `cover_url`,
+  `file_name`, `size`, resolution) hold pre-signed download URLs. Alarms
+  usually list their clips only by `userspaceFileId`; the integration
+  resolves them with `getFileDetails` until they're uploaded.
+
+Seen alarms are stored, so a restart neither re-fires old alarms nor misses
+the ones that happened meanwhile. A new install reports none of the alarms
+already there.
+
+### Push
+
+The 70mai app gets alarms by Firebase push, not by polling. The integration
+registers Home Assistant as a Firebase client of the 70mai app (the same
+approach as Home Assistant's Ring integration), hands the token to 70mai
+and reads the alarm list as soon as a push arrives. It logs in as the
+Android app for this (`deviceType` 2), falling back to the default if 70mai
+refuses. **70mai sends alarm pushes to one device per account**: while push
+is on, the 70mai phone app stops getting them. Turn it off under the
+integration's *Configure* if you prefer the app's notifications. The
+`Push connected` diagnostic sensor shows its state, and every push is also
+fired as a `mai70_push` event.
+
+### Services
+
+- `mai70.fetch_alarm_videos` (`hours`, default 24): look up the clips of
+  every alarm of the last hours again and fire their `video` events, e.g.
+  for alarms missed while Home Assistant was down.
+- `mai70.purge_media` (`folder`, `days`): delete downloaded files older than
+  `days` from a subfolder of a media folder (e.g. clips saved by an
+  automation with the Downloader integration) and remove empty folders.
+
+### Saving clips in Home Assistant
+
+With the Downloader integration set to `/media`, an automation on the
+`video` event can save every clip where Home Assistant's Media browser
+shows it:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: event.my_dashcam_alarm
+    not_from: [unavailable]
+    not_to: [unavailable, unknown]
+conditions:
+  - condition: state
+    entity_id: event.my_dashcam_alarm
+    attribute: event_type
+    state: video
+actions:
+  - repeat:
+      for_each: "{{ trigger.to_state.attributes.videos | dictsort | map('last') | map(attribute='url') | list }}"
+      sequence:
+        - action: downloader.download_file
+          data:
+            url: "{{ repeat.item }}"
+            subdir: "70mai/{{ as_local(as_datetime(trigger.to_state.attributes.alarm_time)).strftime('%Y-%m-%d') }}"
+```
+
 ## Entities
 
 Per discovered dashcam (device name = the nickname set in the 70mai app,
@@ -193,11 +282,18 @@ falling back to its WiFi SSID):
 | `binary_sensor`  | *Device* Monitor video upload        | Diagnostic, read-only state of the monitor-video cloud-upload switch (`getDeviceSwitch`'s `monitorVedioUpload`), with the per-event-type resource key config as an attribute. Toggling it still requires the 70mai app. |
 | `binary_sensor`  | *Device* SIM external power support  | Diagnostic: whether the cellular add-on can power the dashcam on its own, e.g. for parking-mode surveillance without the car battery (`simPluginSupportOutPower`). Same 4G-only gating as the other SIM entities. |
 | `image`          | *Device* Parking photo               | The latest parking-mode snapshot (`getPosition`'s `parkPicUrl`). Only created for the (few) devices that actually populate it. |
-| `event`          | *Device* Alarm                      | Fires a generic `alarm` event per new alarm (collision, motion, etc. - the exact meaning of most alarm-type codes still isn't confirmed, only 101/collision is), with type, time, GPS position, and picture/video URLs as event data, plus the raw alarm payload. No longer filtered to a guessed alarm-type list, so it won't silently miss alarm types outside that guess (a bug in earlier versions). |
+| `event`          | *Device* Alarm                      | `alarm`, `alarm_update` and `video` events, see [Alarms, clips and push](#alarms-clips-and-push). |
+| `image`          | *Device* Last alarm                  | Picture of the newest alarm that has one (its cover, or its clip's cover once uploaded), with the alarm's name, time and clip URL as attributes. "Normal boarding" collisions don't replace it. |
+| `switch`         | *Device* Cloud upload                | The 70mai app's "upload monitor videos" toggle (`setDeviceSwitch`, request as the app sends it). |
+| `binary_sensor`  | *Device* Push connected              | Diagnostic: whether alarms currently arrive by Firebase push; the last push in the attributes. |
 
-Polling runs every 5 minutes by default, except for the GPS position
-(and the parking photo, which comes from the same API call). Those have
-their own lighter, adaptive poll:
+Polling: the alarm list is read every minute (every 5 minutes while push is
+connected). Everything else is cached: battery voltage, dashcam status and
+signal for 5 minutes, data that practically never changes (account country,
+firmware, SIM plugin, upload switch, SIM external power) for an hour. That
+is fewer requests per hour than reading everything every 5 minutes. The GPS
+position (and the parking photo, which comes from the same API call) has
+its own lighter, adaptive poll:
 
 - **every 60 seconds** while the dashcam is driving, i.e. while its last
   reported position is at most 3 minutes old;
@@ -263,10 +359,9 @@ Two things to know when pairing it with this integration:
 ## Work in progress
 
 - Options flow for scan interval / alarm filtering.
-- A way to actually change the monitor-video-upload switch from Home
-  Assistant (`setDeviceSwitch`) - currently read-only.
-- Alarm video/picture clips as local media instead of just the raw COS
-  URL (`get_file_details()`/`download_media()`).
+- Live GPS through the app's websocket: 70mai only pushes positions there
+  after `lostOn` (live tracking), which uses up the 4G Cloud+ quota, so
+  it's deliberately not started automatically.
 - A handful of confirmed-but-intentionally-skipped endpoints (account
   profile data, notification overview, value-added-service status) -
   see `CLAUDE.md` for why each was left out. PRs welcome if you disagree
