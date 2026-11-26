@@ -144,3 +144,30 @@ async def test_fetch_alarm_videos_service(hass: HomeAssistant) -> None:
     state = hass.states.get(entity_id)
     assert state.attributes["event_type"] == "video"
     assert state.attributes["video_url"] == FRONT_URL
+
+
+async def test_each_event_in_one_poll_reaches_automations(hass: HomeAssistant) -> None:
+    """Several alarms resolved in the same poll fire one state change each."""
+    client = AlarmClient()
+    await setup_integration(hass, client)
+    entity_id = er.async_get(hass).async_get_entity_id("event", DOMAIN, f"{DEVICE_ID}_alarm")
+    for n in range(3):
+        fid = f"file{n}"
+        alarm = _alarm(json.dumps([{"key": "front_video", "userspaceFileId": fid}]))
+        alarm["id"] = f"alarm{n}"
+        client.alarms.append(alarm)
+        client.files[fid] = _file(fid, f"https://x/{n}.MP4")
+
+    seen: list = []
+    hass.bus.async_listen(
+        "state_changed",
+        lambda e: seen.append(e.data["new_state"].attributes.get("event_type"))
+        if e.data["entity_id"] == entity_id
+        else None,
+    )
+    response = await hass.services.async_call(
+        DOMAIN, "fetch_alarm_videos", {}, blocking=True, return_response=True
+    )
+    await hass.async_block_till_done()
+    assert response == {"queued_alarms": 3}
+    assert seen.count("video") == 3

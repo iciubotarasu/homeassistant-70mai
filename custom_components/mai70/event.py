@@ -63,6 +63,10 @@ class Mai70AlarmEvent(Mai70Entity, EventEntity):
                     "raw": alarm["raw"],
                 },
             )
+            # One state write per event: EventEntity only keeps the last
+            # _trigger_event() until the state is written, so several alarms
+            # in one poll would otherwise reach automations as just one.
+            self.async_write_ha_state()
         # Fired once per alarm when its uploaded clips (front/rear) get
         # pre-signed download URLs, usually a few minutes after "alarm".
         for alarm in self._device_data.get("new_videos", []):
@@ -82,4 +86,5 @@ class Mai70AlarmEvent(Mai70Entity, EventEntity):
                     "complete": alarm.get("complete"),
                 },
             )
+            self.async_write_ha_state()
         super()._handle_coordinator_update()
